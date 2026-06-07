@@ -22,6 +22,10 @@ let package = Package(
             name: "ActorLinkTests",
             dependencies: ["ActorLink"]
         ),
+        .testTarget(
+            name: "ActorLinkSocketTests",
+            dependencies: ["ActorLinkSocket"]
+        ),
     ],
     swiftLanguageModes: [.v6]
 )
