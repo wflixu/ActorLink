@@ -1,4 +1,4 @@
-// swift-tools-version: 6.3
+// swift-tools-version: 6.0
 
 import PackageDescription
 
@@ -21,6 +21,10 @@ let package = Package(
         .testTarget(
             name: "ActorLinkTests",
             dependencies: ["ActorLink"]
+        ),
+        .testTarget(
+            name: "ActorLinkSocketTests",
+            dependencies: ["ActorLinkSocket"]
         ),
     ],
     swiftLanguageModes: [.v6]

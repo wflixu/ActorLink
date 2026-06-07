@@ -2,28 +2,53 @@ import Foundation
 import ActorLink
 import OSLog
 
-#if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
+#if canImport(Darwin)
 import Darwin
-#elseif os(Linux)
-import Glibc
 #endif
+
+// MARK: - Error Helpers
+
+/// Returns a human-readable string for the current `errno`.
+private func errnoString() -> String {
+    String(cString: strerror(errno))
+}
+
+// MARK: - Connection Gate
+
+/// Async gate that signals when a socket connection is established.
+///
+/// Both `send` and `receive` await this gate, so they suspend until
+/// the background `accept()` (for server) or `connect()` (for client) completes.
+private actor ConnectionGate {
+    private var fd: Int32 = -1
+    private var waiter: CheckedContinuation<Int32, Never>?
+
+    func open(_ clientFD: Int32) {
+        fd = clientFD
+        waiter?.resume(returning: clientFD)
+        waiter = nil
+    }
+
+    func wait() async -> Int32 {
+        if fd >= 0 { return fd }
+        return await withCheckedContinuation { waiter = $0 }
+    }
+}
 
 // MARK: - Transport State
 
-/// Thread-safe container for transport mutable state.
 private struct TransportState: Sendable {
-    var serverFD: Int32 = -1
-    var connectionFD: Int32 = -1
+    var socketFD: Int32 = -1
     var isRunning = false
+    var socketPath: String = ""
 
     mutating func cleanup() {
-        if connectionFD >= 0 {
-            close(connectionFD)
-            connectionFD = -1
+        if socketFD >= 0 {
+            close(socketFD)
+            socketFD = -1
         }
-        if serverFD >= 0 {
-            close(serverFD)
-            serverFD = -1
+        if isRunning, !socketPath.isEmpty {
+            unlink(socketPath)
         }
         isRunning = false
     }
@@ -33,19 +58,80 @@ private struct TransportState: Sendable {
 
 /// A transport that communicates over a Unix Domain Socket.
 ///
-/// Uses length-prefixed framing:
-/// - 4 bytes: message length as big-endian `UInt32`
+/// ## Framing
+/// Messages use length-prefixed framing:
+/// - 4 bytes: payload length as big-endian `UInt32`
 /// - N bytes: JSON-encoded `Envelope`
 ///
-/// On the server side it listens and accepts a single connection.
-/// On the client side it connects to an existing socket.
+/// ## Lifecycle
+/// - Server: `start()` creates the socket, binds, and listens. A background task
+///   accepts the first client connection. `send()` and `receive()` suspend until
+///   the connection is established.
+/// - Client: `start()` creates the socket and connects. `start()` returns once
+///   the connection is ready.
+///
+/// ## Sandbox / App Group
+/// For App Extension scenarios (sandbox), the socket file **must** be placed in an
+/// App Group shared container. Use the ``appGroup(_:socketName:isServer:)`` factory
+/// to create a sandbox-safe transport automatically:
+///
+/// ```swift
+/// let transport = try LocalSocketTransport.appGroup(
+///     "group.com.example",
+///     isServer: true
+/// )
+/// ```
+///
+/// ## Thread Safety
+/// The class uses `OSAllocatedUnfairLock` for FD access and an internal
+/// `ConnectionGate` actor for async connection readiness signaling.
 public final class LocalSocketTransport: @unchecked Sendable, ActorTransport {
-    private let state = OSAllocatedUnfairLock(initialState: TransportState())
+    private let lock = OSAllocatedUnfairLock(initialState: TransportState())
+    private let gate = ConnectionGate()
     private let socketPath: String
     private let isServer: Bool
     private let logger = Logger(subsystem: "com.actorlink", category: "socket")
 
+    // MARK: - Factory
+
+    /// Create a transport in an App Group shared container (sandbox-safe).
+    ///
+    /// This is the recommended way to create a transport for App Extension
+    /// communication. The socket file is placed in the App Group container
+    /// so both the host app and the extension can access it.
+    ///
+    /// - Parameters:
+    ///   - appGroup: The App Group identifier (e.g. `"group.com.example"`).
+    ///   - socketName: Socket file name (default `"actorlink.sock"`).
+    ///   - isServer: `true` to listen/accept, `false` to connect.
+    /// - Throws: `ActorLinkError.transportError` if the App Group is not
+    ///   available (e.g. not configured in entitlements).
+    public static func appGroup(
+        _ appGroup: String,
+        socketName: String = "actorlink.sock",
+        isServer: Bool
+    ) throws -> LocalSocketTransport {
+        guard
+            let container = FileManager.default
+                .containerURL(forSecurityApplicationGroupIdentifier: appGroup)
+        else {
+            throw ActorLinkError.transportError(
+                "App Group '\(appGroup)' not found. "
+                    + "Add the App Groups capability to your entitlements.")
+        }
+        return LocalSocketTransport(
+            socketPath: container.appendingPathComponent(socketName).path,
+            isServer: isServer
+        )
+    }
+
+    // MARK: - Init
+
     /// Create a transport using a Unix Domain Socket.
+    ///
+    /// For sandboxed apps (App Extensions), use ``appGroup(_:socketName:isServer:)``
+    /// instead to ensure the socket is placed in a shared container.
+    ///
     /// - Parameters:
     ///   - socketPath: Path for the socket file.
     ///   - isServer: `true` to listen/accept (server), `false` to connect (client).
@@ -55,50 +141,86 @@ public final class LocalSocketTransport: @unchecked Sendable, ActorTransport {
     }
 
     deinit {
-        state.withLock { $0.cleanup() }
+        lock.withLock { $0.cleanup() }
     }
 
     // MARK: - ActorTransport
 
     public func start(id: String) async throws {
-        try state.withLock { state in
-            guard !state.isRunning else { return }
-            try setupSocket(state: &state)
-            state.isRunning = true
+        let fd = try createSocket()
+
+        if isServer {
+            try bindSocket(fd)
+            listen(fd, 1)
+
+            lock.withLock { state in
+                state.socketFD = fd
+                state.socketPath = socketPath
+                state.isRunning = true
+            }
+
+            logger.debug("Listening on \(self.socketPath)")
+
+            // Accept the first client on a background thread —
+            // must not block the cooperative thread pool.
+            Task.detached { [weak self, fd] in
+                guard let self else { return }
+                let clientFD = accept(fd, nil, nil)
+                guard clientFD >= 0 else {
+                    self.logger.error(
+                        "Accept failed: \(errnoString())")
+                    return
+                }
+                self.lock.withLock { state in
+                    state.socketFD = clientFD
+                }
+                self.logger.debug("Client connected")
+                await self.gate.open(clientFD)
+            }
+        } else {
+            try connectSocket(fd)
+            lock.withLock { state in
+                state.socketFD = fd
+                state.isRunning = true
+            }
+            logger.debug("Connected to \(self.socketPath)")
+            await gate.open(fd)
         }
     }
 
     public func stop() async throws {
-        state.withLock { $0.cleanup() }
+        lock.withLock { $0.cleanup() }
+        logger.debug("Transport stopped")
     }
 
     public func send(_ envelope: Envelope) async throws {
         let data = try JSONEncoder().encode(envelope)
-        try state.withLock { state in
-            let fd = state.connectionFD >= 0 ? state.connectionFD : state.serverFD
-            guard fd >= 0 else {
-                throw ActorLinkError.transportError("No connection available")
-            }
-            try writeLengthPrefixed(data, to: fd)
+        let fd = await gate.wait()
+        guard fd >= 0 else {
+            throw ActorLinkError.transportError("No connection available")
         }
+        try writeLengthPrefixed(data, to: fd)
     }
 
     public func receive() -> AsyncThrowingStream<Envelope, any Error> {
         AsyncThrowingStream { continuation in
             Task.detached { [weak self] in
-                guard let self else { return }
-                let readFD = self.state.withLock { state in
-                    state.connectionFD >= 0 ? state.connectionFD : state.serverFD
+                guard let self else {
+                    continuation.finish()
+                    return
                 }
-                guard readFD >= 0 else {
-                    continuation.finish(throwing: ActorLinkError.transportError("No connection"))
+                let fd = await self.gate.wait()
+                guard fd >= 0 else {
+                    continuation.finish(
+                        throwing: ActorLinkError.transportError("No connection"))
                     return
                 }
                 do {
                     while !Task.isCancelled {
-                        let data = try self.readMessage(from: readFD)
+                        let data = try self.readMessage(from: fd)
                         if data.isEmpty { continue }
-                        let envelope = try JSONDecoder().decode(Envelope.self, from: data)
+                        let envelope = try JSONDecoder().decode(
+                            Envelope.self, from: data)
                         continuation.yield(envelope)
                     }
                     continuation.finish()
@@ -109,100 +231,126 @@ public final class LocalSocketTransport: @unchecked Sendable, ActorTransport {
         }
     }
 
-    // MARK: - Socket
+    // MARK: - Socket Setup
 
-    private func setupSocket(state: inout TransportState) throws {
+    private func createSocket() throws -> Int32 {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
-            throw ActorLinkError.transportError("Failed to create socket")
+            throw ActorLinkError.transportError(
+                "Failed to create socket: \(errnoString())")
         }
-        state.serverFD = fd
+        return fd
+    }
 
-        // Remove existing socket file if present
-        if isServer {
-            unlink(socketPath)
-        }
+    private func bindSocket(_ fd: Int32) throws {
+        // Remove stale socket file from previous run
+        unlink(socketPath)
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
-        let pathLength = min(socketPath.utf8.count, MemoryLayout.size(ofValue: addr.sun_path) - 1)
+        let pathLen = min(
+            socketPath.utf8.count,
+            MemoryLayout.size(ofValue: addr.sun_path) - 1)
         _ = socketPath.withCString { src in
             withUnsafeMutablePointer(to: &addr.sun_path) { dst in
-                strncpy(dst, src, pathLength)
+                strncpy(dst, src, pathLen)
             }
         }
 
-        let result = withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { addrPtr in
-                if isServer {
-                    Darwin.bind(fd, addrPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
-                } else {
-                    Darwin.connect(fd, addrPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
-                }
+        let rc = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(
+                to: sockaddr.self, capacity: 1
+            ) { addrPtr in
+                Darwin.bind(
+                    fd, addrPtr,
+                    socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
-
-        if result < 0 {
-            throw ActorLinkError.transportError("Failed to bind/connect socket")
-        }
-
-        if isServer {
-            listen(fd, 1)
-            logger.debug("Listening on \(self.socketPath)")
-
-            // Accept a single connection (blocks until connected)
-            let clientFD = accept(fd, nil, nil)
-            guard clientFD >= 0 else {
-                throw ActorLinkError.transportError("Failed to accept connection")
-            }
-            state.connectionFD = clientFD
-            logger.debug("Client connected")
-        } else {
-            state.connectionFD = fd
-            logger.debug("Connected to \(self.socketPath)")
+        guard rc >= 0 else {
+            throw ActorLinkError.transportError(
+                "Failed to bind socket at '\(socketPath)': \(errnoString())")
         }
     }
 
-    /// Read one length-prefixed message from a file descriptor.
+    private func connectSocket(_ fd: Int32) throws {
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathLen = min(
+            socketPath.utf8.count,
+            MemoryLayout.size(ofValue: addr.sun_path) - 1)
+        _ = socketPath.withCString { src in
+            withUnsafeMutablePointer(to: &addr.sun_path) { dst in
+                strncpy(dst, src, pathLen)
+            }
+        }
+
+        let rc = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(
+                to: sockaddr.self, capacity: 1
+            ) { addrPtr in
+                Darwin.connect(
+                    fd, addrPtr,
+                    socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard rc >= 0 else {
+            throw ActorLinkError.transportError(
+                "Failed to connect to '\(socketPath)': \(errnoString())")
+        }
+    }
+
+    // MARK: - Read / Write
+
     private func readMessage(from fd: Int32) throws -> Data {
         var rawLength: UInt32 = 0
-        let lengthBytes = withUnsafeMutableBytes(of: &rawLength) { ptr in
+        let n = withUnsafeMutableBytes(of: &rawLength) { ptr in
             read(fd, ptr.baseAddress, 4)
         }
-        guard lengthBytes == 4 else {
-            throw ActorLinkError.transportError("Failed to read message length")
+        guard n == 4 else {
+            throw ActorLinkError.transportError(
+                "Failed to read message length (got \(n) bytes): \(errnoString())")
         }
         let messageLength = Int(UInt32(bigEndian: rawLength))
         guard messageLength > 0 else { return Data() }
 
-        var buffer = [UInt8](repeating: 0, count: messageLength)
+        var buffer = Data(count: messageLength)
         var totalRead = 0
         while totalRead < messageLength {
-            let bytesRead = read(fd, &buffer[totalRead], messageLength - totalRead)
+            let bytesRead = buffer.withUnsafeMutableBytes { ptr in
+                read(
+                    fd,
+                    ptr.baseAddress!.advanced(by: totalRead),
+                    messageLength - totalRead)
+            }
             guard bytesRead > 0 else {
-                throw ActorLinkError.transportError("Connection closed during read")
+                throw ActorLinkError.transportError(
+                    "Connection closed during read: \(errnoString())")
             }
             totalRead += bytesRead
         }
-        return Data(buffer)
+        return buffer
     }
 
-    /// Write data as a length-prefixed message.
     private func writeLengthPrefixed(_ data: Data, to fd: Int32) throws {
-        let rawLength = UInt32(data.count).bigEndian
+        let length = UInt32(data.count).bigEndian
         var header = Data(count: 4)
         header.withUnsafeMutableBytes { ptr in
-            ptr.storeBytes(of: rawLength, as: UInt32.self)
+            ptr.storeBytes(of: length, as: UInt32.self)
         }
-        var written = 0
-        let totalBytes = data.count
         let fullMessage = header + data
-        while written < totalBytes + 4 {
-            let bytes = write(fd, (fullMessage as NSData).bytes + written, fullMessage.count - written)
-            guard bytes >= 0 else {
-                throw ActorLinkError.transportError("Write failed")
+
+        var written = 0
+        while written < fullMessage.count {
+            let n = fullMessage.withUnsafeBytes { ptr in
+                write(
+                    fd, ptr.baseAddress!.advanced(by: written),
+                    fullMessage.count - written)
             }
-            written += bytes
+            guard n >= 0 else {
+                throw ActorLinkError.transportError(
+                    "Write failed: \(errnoString())")
+            }
+            written += n
         }
     }
 }
