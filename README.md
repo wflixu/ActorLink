@@ -2,6 +2,8 @@
 
 > Actor-based IPC Runtime for Swift Applications
 
+[![Swift Package Index](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Fwflixu%2FActorLink%2Fbadge%3Ftype%3Dswift-versions)](https://swiftpackageindex.com/wflixu/ActorLink)
+
 ActorLink 是一个基于 Swift Concurrency 的轻量级 IPC（Inter-Process Communication）运行时。它让开发者使用类似 Actor 的编程模型，在不同进程之间进行类型安全、异步、可扩展的通信，而无需直接处理 XPC、Socket、Notification 等底层细节。
 
 ## 为什么创建 ActorLink
@@ -57,8 +59,9 @@ struct GreetHandler: ActorHandler {
 }
 
 // 创建传输层（服务端）
-let transport = LocalSocketTransport(
-    socketPath: "/tmp/actorlink.sock",
+// 沙盒环境下必须使用 App Group 共享目录：
+let transport = try LocalSocketTransport.appGroup(
+    "group.com.example",
     isServer: true
 )
 
@@ -75,8 +78,8 @@ try await runtime.start()
 import ActorLink
 import ActorLinkSocket
 
-let transport = LocalSocketTransport(
-    socketPath: "/tmp/actorlink.sock",
+let transport = try LocalSocketTransport.appGroup(
+    "group.com.example",
     isServer: false
 )
 let runtime = ActorRuntime(transport: transport)
@@ -89,6 +92,8 @@ let result: String = try await runtime.call(
 )
 print(result) // "Hello, World!"
 ```
+
+> **沙盒说明：** 对于 App Extension 等沙盒场景，socket 文件**必须**放在 App Group 共享目录内。使用 `LocalSocketTransport.appGroup(_:socketName:isServer:)` 工厂方法自动创建，无需手动拼接路径。非沙盒场景（如 Helper Tool、Daemon）可以直接使用 `init(socketPath:isServer:)`。
 
 ## 架构
 

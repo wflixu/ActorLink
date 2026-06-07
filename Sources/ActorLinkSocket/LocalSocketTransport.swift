@@ -6,6 +6,13 @@ import OSLog
 import Darwin
 #endif
 
+// MARK: - Error Helpers
+
+/// Returns a human-readable string for the current `errno`.
+private func errnoString() -> String {
+    String(cString: strerror(errno))
+}
+
 // MARK: - Connection Gate
 
 /// Async gate that signals when a socket connection is established.
@@ -33,11 +40,15 @@ private actor ConnectionGate {
 private struct TransportState: Sendable {
     var socketFD: Int32 = -1
     var isRunning = false
+    var socketPath: String = ""
 
     mutating func cleanup() {
         if socketFD >= 0 {
             close(socketFD)
             socketFD = -1
+        }
+        if isRunning, !socketPath.isEmpty {
+            unlink(socketPath)
         }
         isRunning = false
     }
@@ -59,6 +70,18 @@ private struct TransportState: Sendable {
 /// - Client: `start()` creates the socket and connects. `start()` returns once
 ///   the connection is ready.
 ///
+/// ## Sandbox / App Group
+/// For App Extension scenarios (sandbox), the socket file **must** be placed in an
+/// App Group shared container. Use the ``appGroup(_:socketName:isServer:)`` factory
+/// to create a sandbox-safe transport automatically:
+///
+/// ```swift
+/// let transport = try LocalSocketTransport.appGroup(
+///     "group.com.example",
+///     isServer: true
+/// )
+/// ```
+///
 /// ## Thread Safety
 /// The class uses `OSAllocatedUnfairLock` for FD access and an internal
 /// `ConnectionGate` actor for async connection readiness signaling.
@@ -69,7 +92,46 @@ public final class LocalSocketTransport: @unchecked Sendable, ActorTransport {
     private let isServer: Bool
     private let logger = Logger(subsystem: "com.actorlink", category: "socket")
 
+    // MARK: - Factory
+
+    /// Create a transport in an App Group shared container (sandbox-safe).
+    ///
+    /// This is the recommended way to create a transport for App Extension
+    /// communication. The socket file is placed in the App Group container
+    /// so both the host app and the extension can access it.
+    ///
+    /// - Parameters:
+    ///   - appGroup: The App Group identifier (e.g. `"group.com.example"`).
+    ///   - socketName: Socket file name (default `"actorlink.sock"`).
+    ///   - isServer: `true` to listen/accept, `false` to connect.
+    /// - Throws: `ActorLinkError.transportError` if the App Group is not
+    ///   available (e.g. not configured in entitlements).
+    public static func appGroup(
+        _ appGroup: String,
+        socketName: String = "actorlink.sock",
+        isServer: Bool
+    ) throws -> LocalSocketTransport {
+        guard
+            let container = FileManager.default
+                .containerURL(forSecurityApplicationGroupIdentifier: appGroup)
+        else {
+            throw ActorLinkError.transportError(
+                "App Group '\(appGroup)' not found. "
+                    + "Add the App Groups capability to your entitlements.")
+        }
+        return LocalSocketTransport(
+            socketPath: container.appendingPathComponent(socketName).path,
+            isServer: isServer
+        )
+    }
+
+    // MARK: - Init
+
     /// Create a transport using a Unix Domain Socket.
+    ///
+    /// For sandboxed apps (App Extensions), use ``appGroup(_:socketName:isServer:)``
+    /// instead to ensure the socket is placed in a shared container.
+    ///
     /// - Parameters:
     ///   - socketPath: Path for the socket file.
     ///   - isServer: `true` to listen/accept (server), `false` to connect (client).
@@ -90,19 +152,29 @@ public final class LocalSocketTransport: @unchecked Sendable, ActorTransport {
         if isServer {
             try bindSocket(fd)
             listen(fd, 1)
+
             lock.withLock { state in
                 state.socketFD = fd
+                state.socketPath = socketPath
                 state.isRunning = true
             }
+
+            logger.debug("Listening on \(self.socketPath)")
+
             // Accept the first client on a background thread —
             // must not block the cooperative thread pool.
             Task.detached { [weak self, fd] in
                 guard let self else { return }
                 let clientFD = accept(fd, nil, nil)
-                guard clientFD >= 0 else { return }
+                guard clientFD >= 0 else {
+                    self.logger.error(
+                        "Accept failed: \(errnoString())")
+                    return
+                }
                 self.lock.withLock { state in
                     state.socketFD = clientFD
                 }
+                self.logger.debug("Client connected")
                 await self.gate.open(clientFD)
             }
         } else {
@@ -111,14 +183,14 @@ public final class LocalSocketTransport: @unchecked Sendable, ActorTransport {
                 state.socketFD = fd
                 state.isRunning = true
             }
+            logger.debug("Connected to \(self.socketPath)")
             await gate.open(fd)
         }
     }
 
     public func stop() async throws {
         lock.withLock { $0.cleanup() }
-        // The detached accept task will fail on the next read,
-        // and the receive stream will finish.
+        logger.debug("Transport stopped")
     }
 
     public func send(_ envelope: Envelope) async throws {
@@ -164,13 +236,14 @@ public final class LocalSocketTransport: @unchecked Sendable, ActorTransport {
     private func createSocket() throws -> Int32 {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
-            throw ActorLinkError.transportError("Failed to create socket")
+            throw ActorLinkError.transportError(
+                "Failed to create socket: \(errnoString())")
         }
         return fd
     }
 
     private func bindSocket(_ fd: Int32) throws {
-        // Remove stale socket file
+        // Remove stale socket file from previous run
         unlink(socketPath)
 
         var addr = sockaddr_un()
@@ -188,11 +261,14 @@ public final class LocalSocketTransport: @unchecked Sendable, ActorTransport {
             ptr.withMemoryRebound(
                 to: sockaddr.self, capacity: 1
             ) { addrPtr in
-                Darwin.bind(fd, addrPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+                Darwin.bind(
+                    fd, addrPtr,
+                    socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
-        if rc < 0 {
-            throw ActorLinkError.transportError("Failed to bind socket")
+        guard rc >= 0 else {
+            throw ActorLinkError.transportError(
+                "Failed to bind socket at '\(socketPath)': \(errnoString())")
         }
     }
 
@@ -213,12 +289,13 @@ public final class LocalSocketTransport: @unchecked Sendable, ActorTransport {
                 to: sockaddr.self, capacity: 1
             ) { addrPtr in
                 Darwin.connect(
-                    fd, addrPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+                    fd, addrPtr,
+                    socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
-        if rc < 0 {
+        guard rc >= 0 else {
             throw ActorLinkError.transportError(
-                "Failed to connect to \(socketPath)")
+                "Failed to connect to '\(socketPath)': \(errnoString())")
         }
     }
 
@@ -231,7 +308,7 @@ public final class LocalSocketTransport: @unchecked Sendable, ActorTransport {
         }
         guard n == 4 else {
             throw ActorLinkError.transportError(
-                "Failed to read message length (got \(n) bytes)")
+                "Failed to read message length (got \(n) bytes): \(errnoString())")
         }
         let messageLength = Int(UInt32(bigEndian: rawLength))
         guard messageLength > 0 else { return Data() }
@@ -247,7 +324,7 @@ public final class LocalSocketTransport: @unchecked Sendable, ActorTransport {
             }
             guard bytesRead > 0 else {
                 throw ActorLinkError.transportError(
-                    "Connection closed during read")
+                    "Connection closed during read: \(errnoString())")
             }
             totalRead += bytesRead
         }
@@ -265,10 +342,13 @@ public final class LocalSocketTransport: @unchecked Sendable, ActorTransport {
         var written = 0
         while written < fullMessage.count {
             let n = fullMessage.withUnsafeBytes { ptr in
-                write(fd, ptr.baseAddress!.advanced(by: written), fullMessage.count - written)
+                write(
+                    fd, ptr.baseAddress!.advanced(by: written),
+                    fullMessage.count - written)
             }
             guard n >= 0 else {
-                throw ActorLinkError.transportError("Write failed")
+                throw ActorLinkError.transportError(
+                    "Write failed: \(errnoString())")
             }
             written += n
         }
